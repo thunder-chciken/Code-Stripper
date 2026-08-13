@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, useMemo, useRef, useState } from "react";
+import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type Mode = "text" | "newLink" | "image";
 
@@ -13,6 +13,7 @@ type AnchorInfo = {
 };
 
 type TextRow = {
+  kind: "text";
   id: string;
   order: number;
   type: string;
@@ -30,20 +31,28 @@ type TextRow = {
   imageAlt: string;
   anchor?: AnchorInfo;
   node?: Text;
-  protected?: false;
 };
 
-type AltRow = {
+type ImageRow = {
+  kind: "existingImage";
   id: string;
   order: number;
-  type: "Alt Text";
+  type: "Image";
   tag: "IMG";
-  original: string;
-  value: string;
-  protected: true;
+  originalSrc: string;
+  src: string;
+  alt: string;
+  width: string;
+  height: string;
+  srcValueStart: number | null;
+  srcValueEnd: number | null;
+  insertAt: number;
+  imageNode?: HTMLImageElement;
 };
 
-type EditorRow = TextRow | AltRow;
+type EditorRow = TextRow | ImageRow;
+
+type SeoItem = { level: "pass" | "warning" | "issue" | "tip"; title: string; detail: string };
 
 type RawTag = {
   name: string;
@@ -120,7 +129,8 @@ function anchorFromTag(raw: string, start: number, end: number): AnchorInfo {
     const whole = hrefMatch[0];
     const quoted = hrefMatch[1];
     const value = quoted ? hrefMatch[2] : hrefMatch[3];
-    const relativeValueStart = (hrefMatch.index ?? 0) + whole.lastIndexOf(value);
+    const valueOffset = quoted ? whole.indexOf(quoted) + 1 : whole.lastIndexOf(value);
+    const relativeValueStart = (hrefMatch.index ?? 0) + valueOffset;
     return {
       key: start,
       value: decodeHtml(value),
@@ -133,9 +143,22 @@ function anchorFromTag(raw: string, start: number, end: number): AnchorInfo {
   return { key: start, value: "", valueStart: null, valueEnd: null, insertAt: end - closeOffset };
 }
 
+function attributeFromTag(raw: string, name: string, start: number) {
+  const match = new RegExp(`\\b${name}\\s*=\\s*(?:(["'])(.*?)\\1|([^\\s>]+))`, "i").exec(raw);
+  if (!match) return { value: "", valueStart: null, valueEnd: null };
+  const value = match[2] ?? match[3] ?? "";
+  const quoteOffset = match[1] ? match[0].indexOf(match[1]) + 1 : match[0].lastIndexOf(value);
+  const relativeValueStart = (match.index ?? 0) + quoteOffset;
+  return {
+    value: decodeHtml(value),
+    valueStart: start + relativeValueStart,
+    valueEnd: start + relativeValueStart + value.length,
+  };
+}
+
 function tokenize(source: string) {
   const texts: RawText[] = [];
-  const alts: AltRow[] = [];
+  const images: ImageRow[] = [];
   const stack: RawTag[] = [];
   let cursor = 0;
   const lowerSource = source.toLowerCase();
@@ -187,25 +210,32 @@ function tokenize(source: string) {
     if (name === "a") tag.anchor = anchorFromTag(raw, cursor, end);
 
     if (name === "img") {
-      const altMatch = /\balt\s*=\s*(?:(["'])(.*?)\1|([^\s>]+))/i.exec(raw);
-      if (altMatch) {
-        const alt = decodeHtml(altMatch[2] ?? altMatch[3] ?? "");
-        alts.push({
-          id: `alt-${cursor}`,
-          order: cursor,
-          type: "Alt Text",
-          tag: "IMG",
-          original: alt,
-          value: alt,
-          protected: true,
-        });
-      }
+      const src = attributeFromTag(raw, "src", cursor);
+      const alt = attributeFromTag(raw, "alt", cursor);
+      const width = attributeFromTag(raw, "width", cursor);
+      const height = attributeFromTag(raw, "height", cursor);
+      const closeOffset = raw.trimEnd().endsWith("/>") ? 2 : 1;
+      images.push({
+        kind: "existingImage",
+        id: `image-${cursor}`,
+        order: cursor,
+        type: "Image",
+        tag: "IMG",
+        originalSrc: src.value,
+        src: src.value,
+        alt: alt.value,
+        width: width.value,
+        height: height.value,
+        srcValueStart: src.valueStart,
+        srcValueEnd: src.valueEnd,
+        insertAt: end - closeOffset,
+      });
     }
 
     if (!VOID_TAGS.has(name) && !raw.trimEnd().endsWith("/>")) stack.push(tag);
     cursor = end;
   }
-  return { texts, alts };
+  return { texts, images };
 }
 
 function meaningfulNode(node: Text) {
@@ -244,7 +274,9 @@ function parseSource(source: string): EditorRow[] {
     current = walker.nextNode();
   }
 
-  const { texts, alts } = tokenize(source);
+  const { texts, images } = tokenize(source);
+  const parsedImages = Array.from(parsed.querySelectorAll("img"));
+  images.forEach((image, index) => { image.imageNode = parsedImages[index]; });
   const candidates = texts.filter((token) =>
     token.decoded.trim() && !token.ancestors.some((tag) => EXCLUDED_TAGS.has(tag.name)),
   );
@@ -270,6 +302,7 @@ function parseSource(source: string): EditorRow[] {
     const tag = semantic?.tagName.toLowerCase() ?? token.ancestors.at(-1)?.name ?? "text";
     const anchor = [...token.ancestors].reverse().find((item) => item.name === "a")?.anchor;
     rows.push({
+      kind: "text",
       id: `text-${token.start}-${token.end}`,
       order: token.start,
       type: anchor ? "Link" : (TYPE_NAMES[tag] ?? tag.toUpperCase()),
@@ -290,7 +323,43 @@ function parseSource(source: string): EditorRow[] {
     });
   });
 
-  return [...rows, ...alts].sort((a, b) => a.order - b.order);
+  return [...rows, ...images].sort((a, b) => a.order - b.order);
+}
+
+function analyzeSeo(source: string): SeoItem[] {
+  if (!source.trim()) return [];
+  const doc = new DOMParser().parseFromString(source, "text/html");
+  const items: SeoItem[] = [];
+  const title = doc.querySelector("title")?.textContent?.trim() ?? "";
+  const description = doc.querySelector('meta[name="description" i]')?.getAttribute("content")?.trim() ?? "";
+  const h1Count = doc.querySelectorAll("h1").length;
+  const images = Array.from(doc.querySelectorAll("img"));
+  const missingAlt = images.filter((image) => !image.hasAttribute("alt")).length;
+  const missingDimensions = images.filter((image) => !image.hasAttribute("width") || !image.hasAttribute("height")).length;
+  const language = doc.documentElement.getAttribute("lang")?.trim();
+  const genericLinks = Array.from(doc.querySelectorAll("a")).filter((link) =>
+    /^(click here|here|learn more|read more|more)$/i.test(link.textContent?.trim() ?? ""),
+  ).length;
+
+  if (!title) items.push({ level: "issue", title: "Add a page title", detail: "Search results need a unique, descriptive <title>. Aim for roughly 30–60 characters." });
+  else if (title.length < 30 || title.length > 60) items.push({ level: "warning", title: `Title length: ${title.length} characters`, detail: "A concise 30–60 character title is less likely to be truncated in search results." });
+  else items.push({ level: "pass", title: "Page title looks healthy", detail: `${title.length} characters and present in the document head.` });
+
+  if (!description) items.push({ level: "issue", title: "Add a meta description", detail: "Summarize the page in 120–160 useful characters to improve search-result clicks." });
+  else if (description.length < 70 || description.length > 160) items.push({ level: "warning", title: `Description length: ${description.length} characters`, detail: "Keep the description useful and specific; 120–160 characters is a practical target." });
+  else items.push({ level: "pass", title: "Meta description looks healthy", detail: `${description.length} characters with a clear search snippet available.` });
+
+  if (h1Count === 0) items.push({ level: "issue", title: "No H1 found", detail: "Use one clear H1 that describes the primary topic of the page." });
+  else if (h1Count > 1) items.push({ level: "warning", title: `${h1Count} H1 headings found`, detail: "One primary H1 usually creates the clearest page hierarchy." });
+  else items.push({ level: "pass", title: "Single H1 found", detail: "The page has a clear primary heading." });
+
+  if (!language) items.push({ level: "warning", title: "Document language is missing", detail: "Add a lang attribute to <html> for search engines and assistive technology." });
+  if (missingAlt) items.push({ level: "warning", title: `${missingAlt} image${missingAlt === 1 ? "" : "s"} missing alt text`, detail: "Describe meaningful images; use alt=\"\" only for decorative images." });
+  else if (images.length) items.push({ level: "pass", title: "Image alt coverage is complete", detail: `All ${images.length} image${images.length === 1 ? "" : "s"} include an alt attribute.` });
+  if (missingDimensions) items.push({ level: "tip", title: `${missingDimensions} image${missingDimensions === 1 ? "" : "s"} lack dimensions`, detail: "Width and height attributes help prevent layout shift while images load." });
+  if (genericLinks) items.push({ level: "tip", title: `${genericLinks} generic link label${genericLinks === 1 ? "" : "s"}`, detail: "Use destination-specific link text instead of “click here” or “learn more.”" });
+  if (!doc.querySelector('link[rel="canonical" i]')) items.push({ level: "tip", title: "No canonical URL detected", detail: "A canonical link can prevent duplicate URL variants from competing in search." });
+  return items;
 }
 
 type Patch = { start: number; end: number; value: string };
@@ -303,8 +372,16 @@ function renderText(row: TextRow) {
 function buildOutput(source: string, rows: EditorRow[], linkHrefs: Record<number, string>) {
   const patches: Patch[] = [];
   rows.forEach((candidate) => {
-    if (candidate.protected) return;
-    const row = candidate as TextRow;
+    if (candidate.kind === "existingImage") {
+      if (candidate.src === candidate.originalSrc) return;
+      if (candidate.srcValueStart !== null && candidate.srcValueEnd !== null) {
+        patches.push({ start: candidate.srcValueStart, end: candidate.srcValueEnd, value: escapeAttribute(candidate.src) });
+      } else {
+        patches.push({ start: candidate.insertAt, end: candidate.insertAt, value: ` src="${escapeAttribute(candidate.src)}"` });
+      }
+      return;
+    }
+    const row = candidate;
     if (row.mode === "image") {
       patches.push({
         start: row.start,
@@ -324,7 +401,7 @@ function buildOutput(source: string, rows: EditorRow[], linkHrefs: Record<number
 
   const anchors = new Map<number, AnchorInfo>();
   rows.forEach((row) => {
-    if (!row.protected && row.anchor) anchors.set(row.anchor.key, row.anchor);
+    if (row.kind === "text" && row.anchor) anchors.set(row.anchor.key, row.anchor);
   });
   anchors.forEach((anchor, key) => {
     const next = linkHrefs[key];
@@ -372,14 +449,30 @@ export default function Home() {
   const [linkHrefs, setLinkHrefs] = useState<Record<number, string>>({});
   const [modal, setModal] = useState<ModalState>(null);
   const [copied, setCopied] = useState(false);
+  const [theme, setTheme] = useState<"light" | "dark">("light");
+  const [centerTab, setCenterTab] = useState<"content" | "seo">("content");
   const fileRef = useRef<HTMLInputElement>(null);
   const output = useMemo(() => buildOutput(source, rows, linkHrefs), [source, rows, linkHrefs]);
-  const editableRows = rows.filter((row) => !row.protected);
-  const changedCount = editableRows.filter((candidate) => {
-    const row = candidate as TextRow;
+  const seoItems = useMemo(() => analyzeSeo(output), [output]);
+  const textRows = rows.filter((row): row is TextRow => row.kind === "text");
+  const imageRows = rows.filter((row): row is ImageRow => row.kind === "existingImage");
+  const changedCount = rows.filter((row) => {
+    if (row.kind === "existingImage") return row.src !== row.originalSrc;
     return row.value !== row.original || row.mode !== "text" ||
       (row.anchor && linkHrefs[row.anchor.key] !== undefined && linkHrefs[row.anchor.key] !== row.anchor.value);
   }).length;
+  const seoScore = Math.max(0, 100 - seoItems.reduce((total, item) => total + ({ issue: 20, warning: 10, tip: 4, pass: 0 }[item.level]), 0));
+
+  useEffect(() => {
+    const saved = window.localStorage.getItem("code-stripper-theme");
+    if (saved === "light" || saved === "dark") setTheme(saved);
+  }, []);
+
+  function toggleTheme() {
+    const next = theme === "light" ? "dark" : "light";
+    setTheme(next);
+    window.localStorage.setItem("code-stripper-theme", next);
+  }
 
   function loadSource(next: string) {
     setSource(next);
@@ -390,10 +483,18 @@ export default function Home() {
 
   function updateText(id: string, value: string) {
     setRows((currentRows) => currentRows.map((candidate) => {
-      if (candidate.id !== id || candidate.protected) return candidate;
-      const row = candidate as TextRow;
+      if (candidate.id !== id || candidate.kind !== "text") return candidate;
+      const row = candidate;
       row.node && (row.node.nodeValue = `${row.leading}${value}${row.trailing}`);
       return { ...row, value };
+    }));
+  }
+
+  function updateExistingImage(id: string, src: string) {
+    setRows((currentRows) => currentRows.map((row) => {
+      if (row.id !== id || row.kind !== "existingImage") return row;
+      row.imageNode?.setAttribute("src", src);
+      return { ...row, src };
     }));
   }
 
@@ -405,12 +506,12 @@ export default function Home() {
   function saveLink() {
     if (!modal || modal.kind !== "link") return;
     const target = rows.find((row) => row.id === modal.rowId);
-    if (target && !target.protected && target.anchor) {
+    if (target?.kind === "text" && target.anchor) {
       setLinkHrefs((hrefs) => ({ ...hrefs, [target.anchor!.key]: modal.href }));
     }
     setRows((currentRows) => currentRows.map((candidate) => {
-      if (candidate.id !== modal.rowId || candidate.protected) return candidate;
-      const row = candidate as TextRow;
+      if (candidate.id !== modal.rowId || candidate.kind !== "text") return candidate;
+      const row = candidate;
       if (row.anchor) {
         const anchor = row.node?.parentElement?.closest("a");
         anchor?.setAttribute("href", modal.href);
@@ -431,8 +532,8 @@ export default function Home() {
   function saveImage() {
     if (!modal || modal.kind !== "image") return;
     setRows((currentRows) => currentRows.map((candidate) => {
-      if (candidate.id !== modal.rowId || candidate.protected) return candidate;
-      const row = candidate as TextRow;
+      if (candidate.id !== modal.rowId || candidate.kind !== "text") return candidate;
+      const row = candidate;
       if (row.node?.parentNode && row.mode !== "image") {
         const image = row.node.ownerDocument.createElement("img");
         image.setAttribute("src", modal.src);
@@ -467,7 +568,7 @@ export default function Home() {
   }
 
   return (
-    <main className="app-shell">
+    <main className="app-shell" data-theme={theme}>
       <header className="topbar">
         <div className="brand-block">
           <div className="brand-mark" aria-hidden="true"><i /><i /><i /></div>
@@ -477,13 +578,19 @@ export default function Home() {
           </div>
         </div>
         <div className="status-strip" aria-label="Document status">
-          <span><b>{editableRows.length}</b> text nodes</span>
+          <span><b>{textRows.length}</b> text</span>
+          <span><b>{imageRows.length}</b> images</span>
           <span className={changedCount ? "status-changed" : ""}><b>{changedCount}</b> changes</span>
         </div>
-        <button className="copy-button" onClick={copyOutput} disabled={!source}>
-          <span aria-hidden="true">{copied ? "✓" : "▣"}</span>
-          {copied ? "Copied to clipboard" : "Copy Updated Code"}
-        </button>
+        <div className="top-actions">
+          <button className="theme-toggle" onClick={toggleTheme} aria-label={`Switch to ${theme === "light" ? "dark" : "light"} mode`}>
+            <span aria-hidden="true">{theme === "light" ? "☾" : "☀"}</span>{theme === "light" ? "Dark" : "Light"}
+          </button>
+          <button className="copy-button" onClick={copyOutput} disabled={!source}>
+            <span aria-hidden="true">{copied ? "✓" : "▣"}</span>
+            {copied ? "Copied to clipboard" : "Copy Updated Code"}
+          </button>
+        </div>
       </header>
 
       <section className="workspace">
@@ -518,27 +625,40 @@ export default function Home() {
 
         <section className="panel extraction-panel">
           <div className="panel-heading">
-            <div><span className="eyebrow">02 / Extraction</span><h2>Content Layer</h2></div>
-            <span className="node-count">{rows.length}</span>
+            <div><span className="eyebrow">02 / Extraction</span><h2>{centerTab === "content" ? "Content Layer" : "SEO Review"}</h2></div>
+            <div className="center-tabs" role="tablist" aria-label="Middle panel view">
+              <button className={centerTab === "content" ? "active" : ""} onClick={() => setCenterTab("content")} role="tab" aria-selected={centerTab === "content"}>Content</button>
+              <button className={centerTab === "seo" ? "active" : ""} onClick={() => setCenterTab("seo")} role="tab" aria-selected={centerTab === "seo"}>SEO</button>
+            </div>
           </div>
-          <div className="rows" aria-live="polite">
+          {centerTab === "content" ? <div className="rows" aria-live="polite">
             {!rows.length ? (
               <div className="empty-state">
                 <div className="scan-lines"><i /><i /><i /></div>
                 <strong>No content extracted yet</strong>
-                <p>Meaningful text nodes will appear here in document order.</p>
+                <p>Meaningful text and existing images will appear here in document order.</p>
               </div>
             ) : rows.map((candidate, index) => {
-              if (candidate.protected) {
+              if (candidate.kind === "existingImage") {
+                const ratio = Number(candidate.width) > 0 && Number(candidate.height) > 0 ? `${candidate.width} / ${candidate.height}` : "auto";
                 return (
-                  <article className="node-row protected-row" key={candidate.id}>
-                    <div className="row-meta"><span className="type-badge">ALT TEXT</span><span>#{String(index + 1).padStart(2, "0")}</span></div>
-                    <input value={candidate.value} readOnly aria-label="Protected image alt text" />
-                    <div className="protected-note"><span>◈</span> Protected attribute · unchanged by design</div>
+                  <article className="node-row existing-image-row" key={candidate.id}>
+                    <div className="row-meta"><span className="type-badge">IMAGE</span><span>#{String(index + 1).padStart(2, "0")}</span></div>
+                    <div className="image-card-preview" style={{ aspectRatio: ratio }}>
+                      {candidate.src ? <img src={candidate.src} alt="" /> : <span>No image URL</span>}
+                    </div>
+                    <label className="field-label">Hosted image URL
+                      <input type="url" value={candidate.src} onChange={(event) => updateExistingImage(candidate.id, event.target.value)} placeholder="https://example.com/image.jpg" aria-label="Hosted image URL" />
+                    </label>
+                    <div className="image-details">
+                      <span>Proportion: {candidate.width && candidate.height ? `${candidate.width} × ${candidate.height}` : "Natural"}</span>
+                      <span>Alt: {candidate.alt || "Missing"}</span>
+                    </div>
+                    <div className="protected-note"><span>◇</span> Only src changes · proportions and other attributes stay intact</div>
                   </article>
                 );
               }
-              const row = candidate as TextRow;
+              const row = candidate;
               return (
                 <article className={`node-row ${row.mode === "image" ? "image-row" : ""}`} key={row.id}>
                   <div className="row-meta">
@@ -562,8 +682,29 @@ export default function Home() {
                 </article>
               );
             })}
-          </div>
-          <footer className="panel-footer"><span>Document order preserved</span><span>DOM TreeWalker</span></footer>
+          </div> : <div className="seo-view" aria-live="polite">
+            {!source ? (
+              <div className="empty-state">
+                <div className="seo-empty-mark">SEO</div>
+                <strong>Paste a page to run the audit</strong>
+                <p>Titles, descriptions, headings, links, and images will be checked automatically.</p>
+              </div>
+            ) : <>
+              <div className="seo-score-card">
+                <div className="score-ring" style={{ "--score": `${seoScore * 3.6}deg` } as React.CSSProperties}><strong>{seoScore}</strong><span>/ 100</span></div>
+                <div><span className="eyebrow">On-page essentials</span><strong>{seoScore >= 85 ? "Strong foundation" : seoScore >= 65 ? "A few improvements" : "Needs attention"}</strong><p>Recommendations only—nothing is changed automatically.</p></div>
+              </div>
+              <div className="seo-list">
+                {seoItems.map((item, index) => (
+                  <article className={`seo-item ${item.level}`} key={`${item.title}-${index}`}>
+                    <span className="seo-status" aria-hidden="true">{item.level === "pass" ? "✓" : item.level === "issue" ? "!" : item.level === "warning" ? "•" : "i"}</span>
+                    <div><strong>{item.title}</strong><p>{item.detail}</p></div>
+                  </article>
+                ))}
+              </div>
+            </>}
+          </div>}
+          <footer className="panel-footer"><span>{centerTab === "content" ? "Document order preserved" : `${seoItems.length} checks`}</span><span>{centerTab === "content" ? "DOM TreeWalker" : "Read-only guidance"}</span></footer>
         </section>
 
         <section className="panel preview-panel">
